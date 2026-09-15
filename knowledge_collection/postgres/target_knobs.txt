@@ -19,7 +19,6 @@ max_parallel_workers_per_gather
 max_parallel_workers
 max_wal_senders
 shared_buffers
-huge_pages
 work_mem
 maintenance_work_mem
 logging_collector
@@ -50,8 +49,4 @@ effective_cache_size
 default_statistics_target
 random_page_cost
 jit
-cluster_name
-archive_mode
-shared_preload_libraries
-archive_command
 track_activity_query_size

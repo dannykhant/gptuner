@@ -3,11 +3,14 @@
 GPTuner experiment driver for adco-experiments harness.
 Replaces BenchbaseRunner with HarnessWorkloadRunner (harness Python drivers).
 GPTuner source is imported verbatim and adapted without modifying source files.
+Supports parameterized hardware inputs (CPU cores, RAM GB, disk size/type)
+via CLI arguments and configs/postgres.ini.
 """
 import sys
 import os
 import time
 import json
+import re
 import argparse
 import subprocess
 from configparser import ConfigParser
@@ -25,7 +28,65 @@ from config_recommender.fine_stage import FineStage
 from knowledge_handler.knowledge_preparation import KGPre
 from knowledge_handler.knowledge_transformation import KGTrans
 from knowledge_handler.knowledge_update import KGUpdate
+from knowledge_handler.utils import set_hardware_override
 import space_optimizer.default_space as _ds
+
+
+def sanitize_knob_value(knob, value, memory_gb=2.0):
+    """Ensure knob values dynamically scale with parameterized hardware memory limits."""
+    if value is None:
+        return None
+    val_str = str(value).strip()
+
+    # huge_pages: PostgreSQL in Docker crashes if set to "on" without host hugepage support
+    if knob == "huge_pages":
+        return "off"
+
+    # Avoid loading non-existent libraries or failing on archive commands
+    if knob in ("shared_preload_libraries", "archive_command"):
+        return ""
+
+    if knob == "archive_mode":
+        return "off"
+
+    # Dynamic memory limits proportional to the input memory_gb parameter
+    mem_gb = float(memory_gb)
+    mem_limits_mb = {
+        "shared_buffers": int(mem_gb * 0.50 * 1024),          # e.g., 1024MB for 2GB RAM
+        "effective_cache_size": int(mem_gb * 0.75 * 1024),    # e.g., 1536MB for 2GB RAM
+        "maintenance_work_mem": int(mem_gb * 0.25 * 1024),    # e.g., 512MB for 2GB RAM
+        "work_mem": max(4, int((mem_gb * 1024) / 32)),       # e.g., 64MB for 2GB RAM
+        "wal_buffers": min(64, int(mem_gb * 32)),            # e.g., 64MB for 2GB RAM
+        "autovacuum_work_mem": int(mem_gb * 0.15 * 1024),     # e.g., 300MB for 2GB RAM
+        "logical_decoding_work_mem": int(mem_gb * 0.10 * 1024),# e.g., 200MB for 2GB RAM
+        "temp_buffers": int(mem_gb * 0.10 * 1024),            # e.g., 200MB for 2GB RAM
+    }
+
+    if knob in mem_limits_mb:
+        max_mb = mem_limits_mb[knob]
+        try:
+            if val_str.isdigit():
+                num = int(val_str)
+                max_blocks = max_mb * 128  # 8kB blocks
+                if num > max_blocks:
+                    return str(max_blocks)
+            else:
+                m = re.match(r'^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?$', val_str)
+                if m:
+                    num = float(m.group(1))
+                    unit = (m.group(2) or 'MB').upper()
+                    if 'GB' in unit or 'G' in unit:
+                        mb = num * 1024
+                    elif 'KB' in unit or 'K' in unit:
+                        mb = num / 1024
+                    else:
+                        mb = num
+                    if mb > max_mb:
+                        return f"{max_mb}MB"
+        except Exception:
+            pass
+
+    return val_str
 
 
 class HarnessWorkloadRunner:
@@ -121,13 +182,14 @@ class HarnessWorkloadRunner:
 
 
 class HarnessPgDBMS(PgDBMS):
-    """PgDBMS subclass supporting custom host, port, and connection retry."""
+    """PgDBMS subclass supporting custom host, port, parameterized memory safety, and Docker recovery."""
     def __init__(self, db, user, password, host="127.0.0.1", port=5432,
-                 restart_cmd="docker restart adcoexp-db", recover_script="./scripts/recover_postgres.sh",
+                 memory_gb=2.0, restart_cmd="docker restart adcoexp-db", recover_script="./scripts/recover_postgres.sh",
                  knob_info_path="./knowledge_collection/postgres/knob_info/system_view.json"):
         super().__init__(db, user, password, restart_cmd, recover_script, knob_info_path)
         self.host = host
         self.port = int(port)
+        self.memory_gb = float(memory_gb)
 
     def _connect(self, db=None):
         self.failed_times = 0
@@ -152,17 +214,37 @@ class HarnessPgDBMS(PgDBMS):
 
     def reset_config(self):
         try:
-            self._connect()
+            if not self.connection:
+                self._connect()
             super().reset_config()
         except Exception as e:
             print(f"reset_config error: {e}")
+            self.recover_dbms()
+
+    def set_knob(self, knob, knob_value):
+        clean_val = sanitize_knob_value(knob, knob_value, self.memory_gb)
+        if clean_val is None or clean_val == "":
+            return True
+        return super().set_knob(knob, clean_val)
+
+    def recover_dbms(self):
+        print("Recovering PostgreSQL: clearing postgresql.auto.conf and restarting container...")
+        self._disconnect()
+        container = os.environ.get("PG_CONTAINER_NAME", "adcoexp-db")
+        subprocess.run(["docker", "exec", container, "bash", "-c", "rm -f /var/lib/postgresql/data/postgresql.auto.conf"], check=False)
+        subprocess.run(["docker", "restart", container], check=False)
+        time.sleep(5)
+        return self._connect()
 
     def reconfigure(self):
         self._disconnect()
         if self.restart_cmd:
             os.system(self.restart_cmd)
         time.sleep(3)
-        return self._connect()
+        if self._connect():
+            return True
+        print("Reconfiguration failed to start PostgreSQL. Attempting container recovery...")
+        return self.recover_dbms()
 
 
 def patch_default_space(exp_path, benchmark, dbms_name):
@@ -198,8 +280,10 @@ def patch_default_space(exp_path, benchmark, dbms_name):
             if value is not None:
                 self.dbms.set_knob(knob, value)
 
-        self.dbms.reconfigure()
-        if self.dbms.failed_times >= 4:
+        success = self.dbms.reconfigure()
+        if not success or self.dbms.failed_times >= 4:
+            print(f"Round {self.round} failed to start DB with configuration. Applying penalty.")
+            self.dbms.recover_dbms()
             return -int(self.penalty) / 2
 
         runner = HarnessWorkloadRunner(self.dbms, self.test, exp_path, benchmark, dbms_name, self.summary_path)
@@ -218,10 +302,14 @@ def patch_default_space(exp_path, benchmark, dbms_name):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GPTuner harness runner")
+    parser = argparse.ArgumentParser(description="GPTuner harness runner with parameterized hardware input")
     parser.add_argument("--db", default="postgres", help="DBMS type (postgres/mysql)")
     parser.add_argument("--benchmark", required=True, choices=["smallbank", "tpcc"], help="Target benchmark")
     parser.add_argument("--exp-path", required=True, help="Path to adco-experiments root")
+    parser.add_argument("--memory-gb", type=float, default=None, help="Target DBMS memory limit in GB")
+    parser.add_argument("--cpu-cores", type=int, default=None, help="Target DBMS CPU cores")
+    parser.add_argument("--storage-gb", type=float, default=None, help="Target DBMS storage size in GB")
+    parser.add_argument("--disk-type", type=str, default=None, choices=["SSD", "HDD"], help="Target DBMS disk type")
     parser.add_argument("--coarse-trials", type=int, default=30, help="Number of coarse stage trials")
     parser.add_argument("--fine-trials", type=int, default=110, help="Total trials (coarse + fine)")
     parser.add_argument("--seed", type=int, default=1, help="Random seed")
@@ -237,6 +325,16 @@ def main():
 
     db_sec = cfg["DATABASE"]
     llm_sec = cfg["LLM"] if "LLM" in cfg else {}
+    hw_sec = cfg["HARDWARE"] if "HARDWARE" in cfg else {}
+
+    # Resolve hardware parameters from CLI flags -> config file -> defaults
+    memory_gb = args.memory_gb if args.memory_gb is not None else float(hw_sec.get("memory_gb", 2.0))
+    cpu_cores = args.cpu_cores if args.cpu_cores is not None else int(hw_sec.get("cpu_cores", 2))
+    storage_gb = args.storage_gb if args.storage_gb is not None else float(hw_sec.get("storage_gb", 10.0))
+    disk_type = args.disk_type if args.disk_type is not None else hw_sec.get("disk_type", "SSD")
+
+    print(f"Target Hardware Configuration: {cpu_cores} CPU cores, {memory_gb:.1f} GB RAM, {storage_gb:.1f} GB {disk_type}")
+    set_hardware_override(cpu_cores=cpu_cores, memory_gb=memory_gb, disk_gb=storage_gb, disk_type=disk_type)
 
     db_host = db_sec.get("host", "127.0.0.1")
     db_port = int(db_sec.get("port", 5432))
@@ -259,6 +357,7 @@ def main():
         password=db_password,
         host=db_host,
         port=db_port,
+        memory_gb=memory_gb,
         restart_cmd=restart_cmd,
         recover_script=recover_script,
         knob_info_path=knob_info_path
@@ -281,7 +380,7 @@ def main():
         api_base = llm_sec.get("api_base", "https://generativelanguage.googleapis.com/v1beta/openai/")
         api_key = llm_sec.get("api_key")
         model = llm_sec.get("model", "gemini-3.5-flash-lite")
-        print(f"Running Knowledge Handler with LLM ({model})...")
+        print(f"Running Knowledge Handler with LLM ({model}) for {cpu_cores} CPUs / {memory_gb}GB RAM...")
         try:
             with open(target_knobs_path, "r") as f:
                 target_knobs = [line.strip() for line in f if line.strip()]
