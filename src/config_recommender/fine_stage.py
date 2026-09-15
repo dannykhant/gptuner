@@ -35,13 +35,26 @@ class FineStage(FineSpace):
             intensifier=intensifier.Intensifier(scenario, retries=30),
         )
         # how to be guided by coarse-grained tuning
-        with open(self.coarse_path, "r") as json_file:
+        possible_paths = [
+            self.coarse_path,
+            f"./smac3_output/optimization_results/{self.dbms.name}/coarse/{self.seed}/runhistory.json",
+            f"./smac3_output/coarse/{self.seed}/runhistory.json",
+            f"./optimization_results/{self.dbms.name}/coarse/{self.seed}/runhistory.json",
+        ]
+        coarse_file = self.coarse_path
+        for p in possible_paths:
+            if os.path.exists(p):
+                coarse_file = p
+                break
+
+        with open(coarse_file, "r") as json_file:
             data = json.load(json_file)
         costs = []
-        for i in range(30):
+        num_coarse = len(data.get("data", []))
+        for i in range(num_coarse):
             costs.append(data["data"][i][4])
         # the [:x] configurations with minimal costs
-        index_min_pairs = sorted(enumerate(costs), key=lambda x: x[1])[:30]
+        index_min_pairs = sorted(enumerate(costs), key=lambda x: x[1])[:min(30, num_coarse)]
         # no ordering
         # for index, value in enumerate(costs):
         for index, value in index_min_pairs:

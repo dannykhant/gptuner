@@ -32,8 +32,8 @@ from knowledge_handler.utils import set_hardware_override
 import space_optimizer.default_space as _ds
 
 
-def sanitize_knob_value(knob, value, memory_gb=2.0):
-    """Ensure knob values dynamically scale with parameterized hardware memory limits."""
+def sanitize_knob_value(knob, value, memory_gb=2.0, cpu_cores=2):
+    """Ensure knob values dynamically scale with parameterized hardware memory limits and PostgreSQL 17 bounds."""
     if value is None:
         return None
     val_str = str(value).strip()
@@ -43,11 +43,31 @@ def sanitize_knob_value(knob, value, memory_gb=2.0):
         return "off"
 
     # Avoid loading non-existent libraries or failing on archive commands
-    if knob in ("shared_preload_libraries", "archive_command"):
+    if knob in ("shared_preload_libraries", "archive_command", "cluster_name"):
         return ""
 
     if knob == "archive_mode":
         return "off"
+
+    # Worker and connection limits
+    worker_limits = {
+        "autovacuum_max_workers": max(2, int(cpu_cores * 4)),
+        "max_worker_processes": max(4, int(cpu_cores * 8)),
+        "max_parallel_workers": max(2, int(cpu_cores * 4)),
+        "max_parallel_workers_per_gather": max(1, int(cpu_cores * 2)),
+        "max_parallel_maintenance_workers": max(1, int(cpu_cores * 2)),
+        "max_connections": 200,
+        "max_wal_senders": 10,
+        "max_replication_slots": 10,
+    }
+
+    if knob in worker_limits:
+        try:
+            val_int = int(val_str)
+            if val_int > worker_limits[knob]:
+                return str(worker_limits[knob])
+        except ValueError:
+            pass
 
     # Dynamic memory limits proportional to the input memory_gb parameter
     mem_gb = float(memory_gb)
@@ -109,10 +129,14 @@ class HarnessWorkloadRunner:
         return False
 
     def run_benchmark(self):
+        host = getattr(self.dbms, "host", "127.0.0.1")
+        port = str(getattr(self.dbms, "port", 5432))
         if self.benchmark == "smallbank":
             cmd = [
                 sys.executable, "main.py", "run",
                 "--driver", self.dbms_name,
+                "--host", host,
+                "--port", port,
                 "--accounts", "100000",
                 "--transactions", "2000"
             ]
@@ -151,8 +175,8 @@ class HarnessWorkloadRunner:
                 parts = line_clean.split(",")
                 if len(parts) >= 4:
                     return parts
-            elif line_clean.upper().startswith("TOTAL") and len(line_clean.split()) >= 4:
-                tokens = line_clean.replace("txn/s", "").split()
+            elif line_clean.upper().startswith("TOTAL") and ("TXN/S" in line_clean.upper() or len(line_clean.split()) >= 4):
+                tokens = line_clean.replace("txn/s", "").replace("TXN/S", "").split()
                 if len(tokens) >= 4:
                     return tokens
         return None
@@ -181,15 +205,47 @@ class HarnessWorkloadRunner:
         return 1000.0
 
 
+def prepare_workload_database(exp_path, benchmark, dbms_name, host="127.0.0.1", port=5432):
+    """Ensure benchmark schema and initial data are populated before tuning iterations begin."""
+    print(f"Preparing and checking initial dataset for {benchmark}...")
+    if benchmark == "smallbank":
+        cwd = os.path.join(exp_path, "workload/apps/smallbank")
+        cmd = [
+            sys.executable, "main.py", "load",
+            "--driver", dbms_name,
+            "--host", host,
+            "--port", str(port),
+            "--accounts", "100000",
+            "--threads", "8",
+            "--reset"
+        ]
+        subprocess.run(cmd, cwd=cwd, check=False)
+    elif benchmark == "tpcc":
+        cwd = os.path.join(exp_path, "workload/apps/tpcc")
+        cfg_path = os.path.join(exp_path, "workload/apps/tpcc/db.config")
+        cmd = [
+            sys.executable, "tpcc.py", dbms_name,
+            f"--config={cfg_path}",
+            "--warehouses", "2",
+            "--clients", "4",
+            "--duration", "5",
+            "--reset"
+        ]
+        subprocess.run(cmd, cwd=cwd, check=False)
+    print(f"Dataset preparation for {benchmark} complete.")
+
+
 class HarnessPgDBMS(PgDBMS):
     """PgDBMS subclass supporting custom host, port, parameterized memory safety, and Docker recovery."""
     def __init__(self, db, user, password, host="127.0.0.1", port=5432,
-                 memory_gb=2.0, restart_cmd="docker restart adcoexp-db", recover_script="./scripts/recover_postgres.sh",
+                 memory_gb=2.0, cpu_cores=2, restart_cmd="docker restart adcoexp-db",
+                 recover_script="./scripts/recover_postgres.sh",
                  knob_info_path="./knowledge_collection/postgres/knob_info/system_view.json"):
         super().__init__(db, user, password, restart_cmd, recover_script, knob_info_path)
         self.host = host
         self.port = int(port)
         self.memory_gb = float(memory_gb)
+        self.cpu_cores = int(cpu_cores)
 
     def _connect(self, db=None):
         self.failed_times = 0
@@ -222,7 +278,7 @@ class HarnessPgDBMS(PgDBMS):
             self.recover_dbms()
 
     def set_knob(self, knob, knob_value):
-        clean_val = sanitize_knob_value(knob, knob_value, self.memory_gb)
+        clean_val = sanitize_knob_value(knob, knob_value, self.memory_gb, self.cpu_cores)
         if clean_val is None or clean_val == "":
             return True
         return super().set_knob(knob, clean_val)
@@ -337,6 +393,13 @@ def main():
     set_hardware_override(cpu_cores=cpu_cores, memory_gb=memory_gb, disk_gb=storage_gb, disk_type=disk_type)
 
     db_host = db_sec.get("host", "127.0.0.1")
+    # Resolve host: if 'pgdb' doesn't resolve locally on host, fallback to 127.0.0.1
+    try:
+        import socket
+        socket.gethostbyname(db_host)
+    except socket.gaierror:
+        db_host = "127.0.0.1"
+
     db_port = int(db_sec.get("port", 5432))
     db_user = db_sec.get("user", "postgres")
     db_password = db_sec.get("password", "postgres")
@@ -351,6 +414,9 @@ def main():
     os.makedirs(os.path.join(gptuner_dir, "optimization_results", args.db, "fine"), exist_ok=True)
     os.makedirs(os.path.join(gptuner_dir, "optimization_results", "temp_results"), exist_ok=True)
 
+    # Pre-populate benchmark data if not yet loaded
+    prepare_workload_database(args.exp_path, args.benchmark, args.db, host=db_host, port=db_port)
+
     dbms = HarnessPgDBMS(
         db=db_name,
         user=db_user,
@@ -358,6 +424,7 @@ def main():
         host=db_host,
         port=db_port,
         memory_gb=memory_gb,
+        cpu_cores=cpu_cores,
         restart_cmd=restart_cmd,
         recover_script=recover_script,
         knob_info_path=knob_info_path
@@ -413,6 +480,14 @@ def main():
         initial_config_number=min(10, args.coarse_trials)
     )
 
+    # Ensure coarse runhistory.json is available in optimization_results directory
+    import shutil
+    coarse_src = os.path.join(gptuner_dir, f"smac3_output/optimization_results/{args.db}/coarse/{args.seed}/runhistory.json")
+    coarse_dst = os.path.join(gptuner_dir, f"optimization_results/{args.db}/coarse/{args.seed}/runhistory.json")
+    if os.path.exists(coarse_src):
+        os.makedirs(os.path.dirname(coarse_dst), exist_ok=True)
+        shutil.copyfile(coarse_src, coarse_dst)
+
     print("==================================================")
     print(f" Starting GPTuner Fine Stage for {args.benchmark}")
     print("==================================================")
@@ -429,18 +504,24 @@ def main():
     )
 
     # Read the best configuration from Fine Stage runhistory
-    fine_history_path = os.path.join(gptuner_dir, f"optimization_results/{args.db}/fine/{args.seed}/runhistory.json")
+    fine_history_candidates = [
+        os.path.join(gptuner_dir, f"smac3_output/optimization_results/{args.db}/fine/{args.seed}/runhistory.json"),
+        os.path.join(gptuner_dir, f"optimization_results/{args.db}/fine/{args.seed}/runhistory.json"),
+        os.path.join(gptuner_dir, f"smac3_output/fine/{args.seed}/runhistory.json"),
+    ]
     best_config = {}
-    if os.path.exists(fine_history_path):
-        with open(fine_history_path, "r") as f:
-            hdata = json.load(f)
-        data_entries = hdata.get("data", [])
-        configs = hdata.get("configs", {})
-        if data_entries:
-            best_entry = min(data_entries, key=lambda x: x[4])
-            best_config_id = str(best_entry[0])
-            best_config = configs.get(best_config_id, {})
-            print(f"Best configuration (cost={best_entry[4]}): {best_config}")
+    for fine_history_path in fine_history_candidates:
+        if os.path.exists(fine_history_path):
+            with open(fine_history_path, "r") as f:
+                hdata = json.load(f)
+            data_entries = hdata.get("data", [])
+            configs = hdata.get("configs", {})
+            if data_entries:
+                best_entry = min(data_entries, key=lambda x: x[4])
+                best_config_id = str(best_entry[0])
+                best_config = configs.get(best_config_id, {})
+                print(f"Best configuration (cost={best_entry[4]}): {best_config}")
+                break
 
     out_res_dir = os.path.join(args.exp_path, "results/db_layer/gptuner")
     os.makedirs(out_res_dir, exist_ok=True)

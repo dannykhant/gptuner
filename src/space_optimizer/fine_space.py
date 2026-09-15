@@ -22,7 +22,15 @@ class FineSpace(DefaultSpace):
         super().__init__(dbms, test, timeout, target_knobs_path, seed)
         self.factors = [0, 0.25, 0.5]
         self.define_search_space()
-        self.coarse_path = f"./optimization_results/{self.dbms.name}/coarse/{self.seed}/runhistory.json"
+        self.coarse_path = f"./smac3_output/optimization_results/{self.dbms.name}/coarse/{self.seed}/runhistory.json"
+        for p in [
+            f"./smac3_output/optimization_results/{self.dbms.name}/coarse/{self.seed}/runhistory.json",
+            f"./smac3_output/coarse/{self.seed}/runhistory.json",
+            f"./optimization_results/{self.dbms.name}/coarse/{self.seed}/runhistory.json",
+        ]:
+            if os.path.exists(p):
+                self.coarse_path = p
+                break
 
 
     def define_search_space(self):
