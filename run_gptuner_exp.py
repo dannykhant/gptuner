@@ -205,10 +205,35 @@ class HarnessWorkloadRunner:
         return 1000.0
 
 
-def prepare_workload_database(exp_path, benchmark, dbms_name, host="127.0.0.1", port=5432):
-    """Ensure benchmark schema and initial data are populated before tuning iterations begin."""
+def _table_row_count(host, port, user, password, dbname, table):
+    """Best-effort row count; returns -1 on any failure (caller loads)."""
+    try:
+        conn = psycopg2.connect(host=host, port=int(port), user=user,
+                                password=password, dbname=dbname, connect_timeout=5)
+        try:
+            cur = conn.cursor()
+            cur.execute(f'SELECT count(*) FROM "{table}"')
+            row = cur.fetchone()
+            return int(row[0]) if row else -1
+        finally:
+            conn.close()
+    except Exception:
+        return -1
+
+
+def prepare_workload_database(exp_path, benchmark, dbms_name, host="127.0.0.1", port=5432,
+                              user="postgres", password="postgres", dbname=None):
+    """Ensure benchmark schema and initial data are populated before tuning iterations begin.
+
+    Skips the load when representative data is already present (e.g. the
+    harness restored its snapshot): tpcc needs >= 2 warehouses, smallbank
+    needs >= 100000 accounts (this function's own load sizes).
+    """
     print(f"Preparing and checking initial dataset for {benchmark}...")
     if benchmark == "smallbank":
+        if _table_row_count(host, port, user, password, dbname or "smallbank", "accounts") >= 100000:
+            print(f"Dataset already present for {benchmark}; skipping load.")
+            return
         cwd = os.path.join(exp_path, "workload/apps/smallbank")
         cmd = [
             sys.executable, "main.py", "load",
@@ -221,6 +246,9 @@ def prepare_workload_database(exp_path, benchmark, dbms_name, host="127.0.0.1", 
         ]
         subprocess.run(cmd, cwd=cwd, check=False)
     elif benchmark == "tpcc":
+        if _table_row_count(host, port, user, password, dbname or "tpcc", "warehouse") >= 2:
+            print(f"Dataset already present for {benchmark}; skipping load.")
+            return
         cwd = os.path.join(exp_path, "workload/apps/tpcc")
         cfg_path = os.path.join(exp_path, "workload/apps/tpcc/db.config")
         cmd = [
@@ -415,7 +443,8 @@ def main():
     os.makedirs(os.path.join(gptuner_dir, "optimization_results", "temp_results"), exist_ok=True)
 
     # Pre-populate benchmark data if not yet loaded
-    prepare_workload_database(args.exp_path, args.benchmark, args.db, host=db_host, port=db_port)
+    prepare_workload_database(args.exp_path, args.benchmark, args.db, host=db_host, port=db_port,
+                              user=db_user, password=db_password, dbname=db_name)
 
     dbms = HarnessPgDBMS(
         db=db_name,

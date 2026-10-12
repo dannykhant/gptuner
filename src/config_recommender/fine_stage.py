@@ -3,6 +3,7 @@ from space_optimizer.default_space import DefaultSpace
 from dbms.mysql import MysqlDBMS
 from dbms.postgres import PgDBMS
 from space_optimizer.fine_space import FineSpace
+import os
 import json
 from smac import HyperparameterOptimizationFacade, Scenario, initial_design, intensifier
 from ConfigSpace import (
