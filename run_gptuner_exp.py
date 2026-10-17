@@ -12,6 +12,7 @@ import time
 import json
 import re
 import argparse
+import shutil
 import subprocess
 from configparser import ConfigParser
 
@@ -59,13 +60,34 @@ def sanitize_knob_value(knob, value, memory_gb=2.0, cpu_cores=2):
         "max_connections": 200,
         "max_wal_senders": 10,
         "max_replication_slots": 10,
+        "commit_delay": 1000,
+        "deadlock_timeout": 5000,
+        "wal_writer_delay": 200,
+        "bgwriter_delay": 1000,
+        "from_collapse_limit": 32,
+        "join_collapse_limit": 32,
+        "geqo_threshold": 32,
     }
 
     if knob in worker_limits:
         try:
-            val_int = int(val_str)
+            val_int = int(float(val_str))
             if val_int > worker_limits[knob]:
                 return str(worker_limits[knob])
+        except ValueError:
+            pass
+
+    float_limits = {
+        "autovacuum_vacuum_scale_factor": 0.4,
+        "autovacuum_analyze_scale_factor": 0.4,
+        "vacuum_cost_delay": 20.0,
+    }
+
+    if knob in float_limits:
+        try:
+            val_float = float(val_str)
+            if val_float > float_limits[knob]:
+                return str(float_limits[knob])
         except ValueError:
             pass
 
@@ -84,12 +106,15 @@ def sanitize_knob_value(knob, value, memory_gb=2.0, cpu_cores=2):
 
     if knob in mem_limits_mb:
         max_mb = mem_limits_mb[knob]
+        min_mb = int(mem_gb * 0.25 * 1024) if knob == "effective_cache_size" else None
         try:
             if val_str.isdigit():
                 num = int(val_str)
                 max_blocks = max_mb * 128  # 8kB blocks
                 if num > max_blocks:
                     return str(max_blocks)
+                if min_mb is not None and num < min_mb * 128:
+                    return str(min_mb * 128)
             else:
                 m = re.match(r'^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?$', val_str)
                 if m:
@@ -103,6 +128,8 @@ def sanitize_knob_value(knob, value, memory_gb=2.0, cpu_cores=2):
                         mb = num
                     if mb > max_mb:
                         return f"{max_mb}MB"
+                    if min_mb is not None and mb < min_mb:
+                        return f"{min_mb}MB"
         except Exception:
             pass
 
@@ -146,12 +173,15 @@ class HarnessWorkloadRunner:
             cmd = [
                 sys.executable, "tpcc.py", self.dbms_name,
                 f"--config={cfg_path}",
-                "--warehouses", "2",
-                "--clients", "4",
-                "--duration", "10",
+                "--warehouses", os.environ.get("WAREHOUSES", "32"),
+                "--clients", os.environ.get("CLIENTS", "8"),
+                "--duration", "20",
                 "--no-load"
             ]
             cwd = os.path.join(self.exp_path, "workload/apps/tpcc")
+        elif self.benchmark == "tpch":
+            self._run_tpch_queries(host, port)
+            return
         else:
             raise ValueError(f"Unsupported benchmark: {self.benchmark}")
 
@@ -167,6 +197,49 @@ class HarnessWorkloadRunner:
             print(f"Workload execution error: {e}")
             self._stdout = ""
             self._stderr = str(e)
+
+    def _run_tpch_queries(self, host, port):
+        """Run the 22 TPCH queries sequentially and emit a TOTAL summary line.
+
+        TOTAL,<total_s>,<avg_ms_per_query>,<queries_per_s> matches the
+        _parse_total_row format (latency at index 2, throughput at index 3).
+        """
+        qdir = os.path.join(self.exp_path, "workload/databases/PostgreSQL/tpch")
+        files = [os.path.join(qdir, f"query{i}.sql") for i in range(1, 23)]
+        files = [f for f in files if os.path.exists(f)]
+        user = getattr(self.dbms, "user", "postgres")
+        password = getattr(self.dbms, "password", "postgres")
+        dbname = getattr(self.dbms, "db", self.benchmark)
+        start = time.time()
+        try:
+            conn = psycopg2.connect(host=host, port=int(port), user=user,
+                                    password=password, dbname=dbname, connect_timeout=5)
+            try:
+                conn.autocommit = True
+                cur = conn.cursor()
+                for f in files:
+                    with open(f) as fh:
+                        sql = fh.read()
+                    try:
+                        cur.execute(sql)
+                        try:
+                            cur.fetchall()
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"TPCH query {os.path.basename(f)} failed: {e}")
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+            finally:
+                conn.close()
+        except Exception as e:
+            print(f"TPCH workload execution error: {e}")
+        total = max(time.time() - start, 1e-3)
+        n = max(len(files), 1)
+        self._stdout = f"TOTAL,{total:.3f},{total / n * 1000.0:.2f},{n / total:.4f}\n"
+        self._stderr = ""
 
     def _parse_total_row(self):
         for line in self._stdout.splitlines():
@@ -260,6 +333,13 @@ def prepare_workload_database(exp_path, benchmark, dbms_name, host="127.0.0.1", 
             "--reset"
         ]
         subprocess.run(cmd, cwd=cwd, check=False)
+    elif benchmark == "tpch":
+        # No Python loader for tpch; data comes from the harness snapshot
+        # (bench_fresh_db). Skip when representative data is already present.
+        if _table_row_count(host, port, user, password, dbname or "tpch", "lineitem") >= 100000:
+            print(f"Dataset already present for {benchmark}; skipping load.")
+            return
+        print(f"TPCH dataset not detected; expecting the harness snapshot to provide it.")
     print(f"Dataset preparation for {benchmark} complete.")
 
 
@@ -388,7 +468,7 @@ def patch_default_space(exp_path, benchmark, dbms_name):
 def main():
     parser = argparse.ArgumentParser(description="GPTuner harness runner with parameterized hardware input")
     parser.add_argument("--db", default="postgres", help="DBMS type (postgres/mysql)")
-    parser.add_argument("--benchmark", required=True, choices=["smallbank", "tpcc"], help="Target benchmark")
+    parser.add_argument("--benchmark", required=True, choices=["smallbank", "tpcc", "tpch"], help="Target benchmark")
     parser.add_argument("--exp-path", required=True, help="Path to adco-experiments root")
     parser.add_argument("--memory-gb", type=float, default=None, help="Target DBMS memory limit in GB")
     parser.add_argument("--cpu-cores", type=int, default=None, help="Target DBMS CPU cores")
@@ -437,6 +517,14 @@ def main():
     knob_info_path = os.path.join(gptuner_dir, db_sec.get("knob_info_path", "./knowledge_collection/postgres/knob_info/system_view.json"))
 
     os.chdir(gptuner_dir)
+    for stale_dir in [
+        os.path.join(gptuner_dir, "smac3_output", "optimization_results", args.db, "coarse"),
+        os.path.join(gptuner_dir, "smac3_output", "optimization_results", args.db, "fine"),
+        os.path.join(gptuner_dir, "optimization_results", args.db, "coarse"),
+        os.path.join(gptuner_dir, "optimization_results", args.db, "fine"),
+        os.path.join(gptuner_dir, "optimization_results", args.db, "log"),
+    ]:
+        shutil.rmtree(stale_dir, ignore_errors=True)
     os.makedirs(os.path.join(gptuner_dir, "optimization_results", args.db, "log"), exist_ok=True)
     os.makedirs(os.path.join(gptuner_dir, "optimization_results", args.db, "coarse"), exist_ok=True)
     os.makedirs(os.path.join(gptuner_dir, "optimization_results", args.db, "fine"), exist_ok=True)
@@ -510,7 +598,6 @@ def main():
     )
 
     # Ensure coarse runhistory.json is available in optimization_results directory
-    import shutil
     coarse_src = os.path.join(gptuner_dir, f"smac3_output/optimization_results/{args.db}/coarse/{args.seed}/runhistory.json")
     coarse_dst = os.path.join(gptuner_dir, f"optimization_results/{args.db}/coarse/{args.seed}/runhistory.json")
     if os.path.exists(coarse_src):
@@ -563,8 +650,18 @@ def main():
     if best_config:
         print("Applying best configuration to database...")
         dbms.reset_config()
-        for knob, value in best_config.items():
-            if not knob.startswith("control_") and not knob.startswith("special_"):
+        for knob in fine.target_knobs:
+            try:
+                control_para = best_config.get(f"control_{knob}")
+                if control_para == "0":
+                    value = best_config[knob]
+                elif control_para == "1":
+                    value = best_config[f"special_{knob}"]
+                else:
+                    value = best_config.get(knob, None)
+            except Exception:
+                value = best_config.get(knob, None)
+            if value is not None:
                 dbms.set_knob(knob, value)
         dbms.reconfigure()
         print("Best configuration applied.")
